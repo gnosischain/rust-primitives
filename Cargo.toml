@@ -1,16 +1,16 @@
 [package]
 name = "gnosis-primitives"
-version = "0.1.113-7b4c07"
+version = "0.1.113-b3f5e62"
 edition = "2024"
 
 [dependencies]
-reth = { git = "https://github.com/paradigmxyz/reth", rev = "7b4c07338e098a3148bde43794f559df8ca1c314" }
-reth-db = { git = "https://github.com/paradigmxyz/reth", rev = "7b4c07338e098a3148bde43794f559df8ca1c314" }
-reth-codecs = { git = "https://github.com/paradigmxyz/reth", rev = "7b4c07338e098a3148bde43794f559df8ca1c314" }
-reth-tracing = { git = "https://github.com/paradigmxyz/reth", rev = "7b4c07338e098a3148bde43794f559df8ca1c314" }
-reth-chainspec = { git = "https://github.com/paradigmxyz/reth", rev = "7b4c07338e098a3148bde43794f559df8ca1c314" }
-reth-cli-commands = { git = "https://github.com/paradigmxyz/reth", rev = "7b4c07338e098a3148bde43794f559df8ca1c314" }
-reth-primitives-traits = { git = "https://github.com/paradigmxyz/reth", rev = "7b4c07338e098a3148bde43794f559df8ca1c314" }
+reth = { git = "https://github.com/paradigmxyz/reth", rev = "b3f5e62494b58b2bf8c364736e4b75ed2fa6c0c8" }
+reth-db = { git = "https://github.com/paradigmxyz/reth", rev = "b3f5e62494b58b2bf8c364736e4b75ed2fa6c0c8" }
+reth-codecs = { git = "https://github.com/paradigmxyz/reth", rev = "b3f5e62494b58b2bf8c364736e4b75ed2fa6c0c8" }
+reth-tracing = { git = "https://github.com/paradigmxyz/reth", rev = "b3f5e62494b58b2bf8c364736e4b75ed2fa6c0c8" }
+reth-chainspec = { git = "https://github.com/paradigmxyz/reth", rev = "b3f5e62494b58b2bf8c364736e4b75ed2fa6c0c8" }
+reth-cli-commands = { git = "https://github.com/paradigmxyz/reth", rev = "b3f5e62494b58b2bf8c364736e4b75ed2fa6c0c8" }
+reth-primitives-traits = { git = "https://github.com/paradigmxyz/reth", rev = "b3f5e62494b58b2bf8c364736e4b75ed2fa6c0c8" }
 
 # Force specific vergen versions to avoid conflicts
 # vergen = "=9.0.6"
