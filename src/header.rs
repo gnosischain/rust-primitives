@@ -11,11 +11,8 @@ use alloy_rlp::{BufMut, Decodable, Encodable, length_of_length};
 use alloy_trie::EMPTY_ROOT_HASH;
 use reth_chainspec::BaseFeeParams;
 use reth_cli_commands::common::HeaderMut;
-use reth_codecs::Compact;
-use reth_db::{
-    DatabaseError,
-    table::{Compress, Decompress},
-};
+use reth_codecs::{Compact, DecompressError};
+use reth_db::table::{Compress, Decompress};
 use reth_primitives_traits::InMemorySize;
 use reth_tracing::tracing::debug;
 use serde::{Deserialize, Serialize};
@@ -151,6 +148,24 @@ pub struct GnosisHeader {
     /// [EIP-7685]: https://eips.ethereum.org/EIPS/eip-7685
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requests_hash: Option<B256>,
+    /// The Keccak 256-bit hash of the block's access list.
+    ///
+    /// When no state changes are present, this field is the hash of an empty RLP list:
+    /// `keccak256(rlp.encode([]))` =
+    /// `0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347`
+    ///
+    /// [EIP-7928]: https://eips.ethereum.org/EIPS/eip-7928
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_access_list_hash: Option<B256>,
+    /// The slot number corresponding to this block, calculated in the consensus layer.
+    ///
+    /// [EIP-7843]: https://eips.ethereum.org/EIPS/eip-7843
+    #[serde(
+        default,
+        with = "alloy_serde::quantity::opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub slot_number: Option<u64>,
 }
 
 impl GnosisHeader {
@@ -268,10 +283,6 @@ impl GnosisHeader {
             length += self.aura_step.unwrap_or(U256::ZERO).length();
             length += self.aura_seal.as_ref().map_or(0, |seal| seal.length());
         }
-        // length += self.mix_hash.is_some().then(|| self.mix_hash.unwrap().length()).unwrap_or(0);
-        // length += self.nonce.is_some().then(|| self.nonce.unwrap().length()).unwrap_or(0);
-        // length += self.is_post_merge().then(|| self.aura_step.unwrap().length()).unwrap_or(0);
-        // length += self.aura_seal.as_ref().map_or(0, |seal| seal.length());
 
         if let Some(base_fee) = self.base_fee_per_gas {
             // Adding base fee length if it exists.
@@ -299,6 +310,14 @@ impl GnosisHeader {
 
         if let Some(requests_hash) = self.requests_hash {
             length += requests_hash.length();
+        }
+
+        if let Some(block_access_list_hash) = self.block_access_list_hash {
+            length += block_access_list_hash.length();
+        }
+
+        if let Some(slot_number) = self.slot_number {
+            length += U256::from(slot_number).length();
         }
 
         length
@@ -360,6 +379,13 @@ impl GnosisHeader {
         self.requests_hash.is_some()
     }
 
+    /// True if the Amsterdam hardfork is active.
+    ///
+    /// This function checks that the block access list hash is present.
+    pub const fn amsterdam_active(&self) -> bool {
+        self.block_access_list_hash.is_some()
+    }
+
     pub fn is_post_merge(&self) -> bool {
         self.mix_hash.is_some() && self.nonce.is_some()
     }
@@ -396,6 +422,8 @@ impl GnosisHeader {
             excess_blob_gas: self.excess_blob_gas,
             parent_beacon_block_root: self.parent_beacon_block_root,
             requests_hash: self.requests_hash,
+            block_access_list_hash: self.block_access_list_hash,
+            slot_number: self.slot_number,
         }
     }
 }
@@ -427,6 +455,8 @@ impl From<Header> for GnosisHeader {
             excess_blob_gas: inner.excess_blob_gas,
             parent_beacon_block_root: inner.parent_beacon_block_root,
             requests_hash: inner.requests_hash,
+            block_access_list_hash: inner.block_access_list_hash,
+            slot_number: inner.slot_number,
         }
     }
 }
@@ -460,16 +490,11 @@ impl From<GnosisHeader> for Header {
             excess_blob_gas: gnosis_header.excess_blob_gas,
             parent_beacon_block_root: gnosis_header.parent_beacon_block_root,
             requests_hash: gnosis_header.requests_hash,
+            block_access_list_hash: gnosis_header.block_access_list_hash,
+            slot_number: gnosis_header.slot_number,
         }
     }
 }
-
-// // impl Into<&alloy_consensus::Header> for GnosisHeader
-// impl Into<&Header> for GnosisHeader {
-//     fn into(self) -> &Header {
-//         &self.to_alloy_header()
-//     }
-// }
 
 impl AsRef<Self> for GnosisHeader {
     fn as_ref(&self) -> &Self {
@@ -566,6 +591,14 @@ impl alloy_consensus::BlockHeader for GnosisHeader {
         self.requests_hash
     }
 
+    fn block_access_list_hash(&self) -> Option<B256> {
+        self.block_access_list_hash
+    }
+
+    fn slot_number(&self) -> Option<u64> {
+        self.slot_number
+    }
+
     fn extra_data(&self) -> &Bytes {
         &self.extra_data
     }
@@ -643,6 +676,14 @@ impl Encodable for GnosisHeader {
             requests_hash.encode(&mut buffer);
         }
 
+        if let Some(ref block_access_list_hash) = self.block_access_list_hash {
+            block_access_list_hash.encode(out);
+        }
+
+        if let Some(ref slot_number) = self.slot_number {
+            U256::from(*slot_number).encode(out);
+        }
+
         // Write the encoded buffer to the output
         out.put_slice(&buffer);
     }
@@ -677,8 +718,7 @@ impl Decodable for GnosisHeader {
             gas_used: u64::decode(buf)?,
             timestamp: Decodable::decode(buf)?,
             extra_data: Decodable::decode(buf)?,
-            // mix_hash: Some(Decodable::decode(buf)?),
-            // nonce: Some(B64::decode(buf)?),
+
             mix_hash: None,
             nonce: None,
             aura_step: None,
@@ -690,6 +730,8 @@ impl Decodable for GnosisHeader {
             excess_blob_gas: None,
             parent_beacon_block_root: None,
             requests_hash: None,
+            block_access_list_hash: None,
+            slot_number: None,
         };
 
         // Peek at the next RLP header without advancing buf
@@ -743,6 +785,16 @@ impl Decodable for GnosisHeader {
             this.requests_hash = Some(B256::decode(buf)?);
         }
 
+        // Decode block access list hash.
+        if started_len - buf.len() < rlp_head.payload_length {
+            this.block_access_list_hash = Some(B256::decode(buf)?);
+        }
+
+        // Decode slot number.
+        if started_len - buf.len() < rlp_head.payload_length {
+            this.slot_number = Some(u64::decode(buf)?);
+        }
+
         let consumed = started_len - buf.len();
         if consumed != rlp_head.payload_length {
             return Err(alloy_rlp::Error::ListLengthMismatch {
@@ -778,6 +830,8 @@ struct CompactHeader {
     excess_blob_gas: Option<u64>,
     parent_beacon_block_root: Option<B256>,
     requests_hash: Option<B256>,
+    block_access_list_hash: Option<B256>,
+    slot_number: Option<u64>,
     extra_data: Bytes,
 }
 
@@ -813,6 +867,8 @@ impl reth_codecs::Compact for GnosisHeader {
             excess_blob_gas: self.excess_blob_gas,
             parent_beacon_block_root: self.parent_beacon_block_root,
             requests_hash: self.requests_hash,
+            block_access_list_hash: self.block_access_list_hash,
+            slot_number: self.slot_number,
             extra_data: self.extra_data.clone(),
         };
         header.to_compact(buf)
@@ -847,6 +903,8 @@ impl reth_codecs::Compact for GnosisHeader {
             excess_blob_gas: header.excess_blob_gas,
             parent_beacon_block_root: header.parent_beacon_block_root,
             requests_hash: header.requests_hash,
+            block_access_list_hash: header.block_access_list_hash,
+            slot_number: header.slot_number,
             extra_data: header.extra_data,
         };
         (alloy_header, buf)
@@ -862,7 +920,7 @@ impl Compress for GnosisHeader {
 }
 
 impl Decompress for GnosisHeader {
-    fn decompress(value: &[u8]) -> Result<GnosisHeader, DatabaseError> {
+    fn decompress(value: &[u8]) -> Result<GnosisHeader, DecompressError> {
         let (obj, _) = Compact::from_compact(value, value.len());
         Ok(obj)
     }
@@ -887,6 +945,18 @@ impl HeaderMut for GnosisHeader {
 
     fn set_difficulty(&mut self, difficulty: U256) {
         self.difficulty = difficulty;
+    }
+
+    fn set_mix_hash(&mut self, mix_hash: B256) {
+        self.mix_hash = Some(mix_hash);
+    }
+
+    fn set_extra_data(&mut self, extra_data: Bytes) {
+        self.extra_data = extra_data;
+    }
+
+    fn set_parent_beacon_block_root(&mut self, parent_beacon_block_root: Option<B256>) {
+        self.parent_beacon_block_root = parent_beacon_block_root;
     }
 }
 
@@ -924,6 +994,8 @@ mod tests {
             excess_blob_gas: None,
             parent_beacon_block_root: None,
             requests_hash: None,
+            block_access_list_hash: None,
+            slot_number: None,
         }
     }
 
@@ -954,6 +1026,8 @@ mod tests {
             excess_blob_gas: None,
             parent_beacon_block_root: None,
             requests_hash: None,
+            block_access_list_hash: None,
+            slot_number: None,
         }
     }
 
@@ -1248,6 +1322,8 @@ mod tests {
             excess_blob_gas: None,
             parent_beacon_block_root: None,
             requests_hash: None,
+            block_access_list_hash: None,
+            slot_number: None,
         };
 
         let gnosis_header: GnosisHeader = alloy_header.clone().into();
@@ -1441,6 +1517,8 @@ mod tests {
             excess_blob_gas: Some(50000),
             parent_beacon_block_root: Some(B256::from([9u8; 32])),
             requests_hash: Some(B256::from([10u8; 32])),
+            block_access_list_hash: None,
+            slot_number: None,
         };
 
         assert!(header.shanghai_active());
@@ -1484,6 +1562,8 @@ mod tests {
             excess_blob_gas: None,
             parent_beacon_block_root: None,
             requests_hash: None,
+            block_access_list_hash: None,
+            slot_number: None,
         };
 
         assert!(header.is_pre_merge());

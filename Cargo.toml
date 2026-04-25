@@ -1,27 +1,24 @@
 [package]
 name = "gnosis-primitives"
-version = "0.1.113-dcc697f"
+version = "0.2.1"
 edition = "2024"
 
 [dependencies]
-reth = { git = "https://github.com/paradigmxyz/reth", rev = "dcc697ffb5432ef8e10db41eac94426972a5f322" }
-reth-db = { git = "https://github.com/paradigmxyz/reth", rev = "dcc697ffb5432ef8e10db41eac94426972a5f322" }
-reth-codecs = { git = "https://github.com/paradigmxyz/reth", rev = "dcc697ffb5432ef8e10db41eac94426972a5f322" }
-reth-tracing = { git = "https://github.com/paradigmxyz/reth", rev = "dcc697ffb5432ef8e10db41eac94426972a5f322" }
-reth-chainspec = { git = "https://github.com/paradigmxyz/reth", rev = "dcc697ffb5432ef8e10db41eac94426972a5f322" }
-reth-cli-commands = { git = "https://github.com/paradigmxyz/reth", rev = "dcc697ffb5432ef8e10db41eac94426972a5f322" }
-reth-primitives-traits = { git = "https://github.com/paradigmxyz/reth", rev = "dcc697ffb5432ef8e10db41eac94426972a5f322" }
+reth = { git = "https://github.com/paradigmxyz/reth", tag = "v2.1.0" }
+reth-db = { git = "https://github.com/paradigmxyz/reth", tag = "v2.1.0" }
+reth-tracing = { git = "https://github.com/paradigmxyz/reth", tag = "v2.1.0" }
+reth-chainspec = { git = "https://github.com/paradigmxyz/reth", tag = "v2.1.0" }
+reth-cli-commands = { git = "https://github.com/paradigmxyz/reth", tag = "v2.1.0" }
 
-# Force specific vergen versions to avoid conflicts
-# vergen = "=9.0.6"
-# vergen-git2 = "=1.0.7"
-# vergen-lib = "=0.1.6"
+# Independent crates
+reth-codecs = { version = "0.3.0", default-features = false }
+reth-primitives-traits = { version = "0.3.0", default-features = false }
 
 alloy-primitives = { version = "1.5.6", default-features = false }
 
-alloy-consensus = { version = "1.7.3", default-features = false }
-alloy-eips = { version = "1.7.3", default-features = false }
-alloy-serde = { version = "1.7.3", default-features = false }
+alloy-consensus = { version = "2.0.0", default-features = false }
+alloy-eips = { version = "2.0.0", default-features = false }
+alloy-serde = { version = "2.0.0", default-features = false }
 
 alloy-rlp = { version = "0.3.13", default-features = false }
 
