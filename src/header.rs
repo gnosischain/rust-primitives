@@ -806,6 +806,14 @@ impl Decodable for GnosisHeader {
     }
 }
 
+// On-disk compact layout for `GnosisHeader`.
+//
+// The bitflag prefix is frozen at 4 bytes (32 bits, 0 unused) to stay
+// byte-compatible with databases produced by gnosis-primitives v0.1.x.
+// `extra_fields` occupies the same 1-bit slot that v0.1.x used for
+// `requests_hash`, mirroring the trick used by upstream reth in
+// paradigmxyz/reth#11166: any future header field MUST be added inside
+// `HeaderExt`, not to this struct.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize, Compact)]
 struct CompactHeader {
     parent_hash: B256,
@@ -829,10 +837,36 @@ struct CompactHeader {
     blob_gas_used: Option<u64>,
     excess_blob_gas: Option<u64>,
     parent_beacon_block_root: Option<B256>,
+    extra_fields: Option<HeaderExt>,
+    extra_data: Bytes,
+}
+
+/// Extension fields for [`CompactHeader`].
+///
+/// New header fields go here, never on [`CompactHeader`] directly, so the
+/// parent bitflag layout stays stable. Old rows (where every field on this
+/// struct would be `None`) encode as `extra_fields: None` and round-trip
+/// byte-identically with the v0.1.x layout.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize, Compact)]
+struct HeaderExt {
     requests_hash: Option<B256>,
     block_access_list_hash: Option<B256>,
     slot_number: Option<u64>,
-    extra_data: Bytes,
+}
+
+impl HeaderExt {
+    /// Collapses an all-`None` `HeaderExt` to `None`, so that headers with
+    /// no extension fields encode byte-identically to legacy rows.
+    const fn into_option(self) -> Option<Self> {
+        if self.requests_hash.is_some()
+            || self.block_access_list_hash.is_some()
+            || self.slot_number.is_some()
+        {
+            Some(self)
+        } else {
+            None
+        }
+    }
 }
 
 impl reth_codecs::Compact for GnosisHeader {
@@ -840,6 +874,11 @@ impl reth_codecs::Compact for GnosisHeader {
     where
         B: alloy_rlp::bytes::BufMut + AsMut<[u8]>,
     {
+        let extra_fields = HeaderExt {
+            requests_hash: self.requests_hash,
+            block_access_list_hash: self.block_access_list_hash,
+            slot_number: self.slot_number,
+        };
         let header = CompactHeader {
             parent_hash: self.parent_hash,
             ommers_hash: self.ommers_hash,
@@ -855,27 +894,21 @@ impl reth_codecs::Compact for GnosisHeader {
             gas_used: self.gas_used,
             timestamp: self.timestamp,
             mix_hash: self.mix_hash,
-            nonce: if let Some(n) = self.nonce {
-                Some(n.into())
-            } else {
-                None
-            },
+            nonce: self.nonce.map(Into::into),
             aura_step: self.aura_step,
             aura_seal: self.aura_seal,
             base_fee_per_gas: self.base_fee_per_gas,
             blob_gas_used: self.blob_gas_used,
             excess_blob_gas: self.excess_blob_gas,
             parent_beacon_block_root: self.parent_beacon_block_root,
-            requests_hash: self.requests_hash,
-            block_access_list_hash: self.block_access_list_hash,
-            slot_number: self.slot_number,
+            extra_fields: extra_fields.into_option(),
             extra_data: self.extra_data.clone(),
         };
         header.to_compact(buf)
     }
 
     fn from_compact(buf: &[u8], len: usize) -> (Self, &[u8]) {
-        let (header, _) = CompactHeader::from_compact(buf, len);
+        let (header, buf) = CompactHeader::from_compact(buf, len);
         let alloy_header = Self {
             parent_hash: header.parent_hash,
             ommers_hash: header.ommers_hash,
@@ -891,20 +924,19 @@ impl reth_codecs::Compact for GnosisHeader {
             gas_used: header.gas_used,
             timestamp: header.timestamp,
             mix_hash: header.mix_hash,
-            nonce: if let Some(n) = header.nonce {
-                Some(n.into())
-            } else {
-                None
-            },
+            nonce: header.nonce.map(Into::into),
             aura_step: header.aura_step,
             aura_seal: header.aura_seal,
             base_fee_per_gas: header.base_fee_per_gas,
             blob_gas_used: header.blob_gas_used,
             excess_blob_gas: header.excess_blob_gas,
             parent_beacon_block_root: header.parent_beacon_block_root,
-            requests_hash: header.requests_hash,
-            block_access_list_hash: header.block_access_list_hash,
-            slot_number: header.slot_number,
+            requests_hash: header.extra_fields.as_ref().and_then(|h| h.requests_hash),
+            block_access_list_hash: header
+                .extra_fields
+                .as_ref()
+                .and_then(|h| h.block_access_list_hash),
+            slot_number: header.extra_fields.as_ref().and_then(|h| h.slot_number),
             extra_data: header.extra_data,
         };
         (alloy_header, buf)
@@ -1029,6 +1061,23 @@ mod tests {
             block_access_list_hash: None,
             slot_number: None,
         }
+    }
+
+    /// CI gate. The compact on-disk layout must stay byte-compatible with
+    /// gnosis-primitives v0.1.x. The parent `CompactHeader` bitflag is
+    /// exactly 4 bytes (32 bits, 0 unused); any addition that bumps this
+    /// would silently break every existing database on next read. Add new
+    /// header fields inside `HeaderExt` instead — see
+    /// paradigmxyz/reth#11166 for the rationale.
+    #[test]
+    fn freeze_compact_header_bitflag_layout() {
+        assert_eq!(
+            CompactHeader::bitflag_encoded_bytes(),
+            4,
+            "CompactHeader bitflag size must not change — add new fields to HeaderExt instead",
+        );
+        assert_eq!(CompactHeader::bitflag_unused_bits(), 0);
+        assert_eq!(HeaderExt::bitflag_encoded_bytes(), 1);
     }
 
     #[test]
