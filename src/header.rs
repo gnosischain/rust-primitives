@@ -961,56 +961,78 @@ impl reth_codecs::Compact for GnosisHeader {
     }
 
     fn from_compact(buf: &[u8], len: usize) -> (Self, &[u8]) {
-        // Try the current (v0.2.x) layout first. The auto-derived decoder
-        // panics on legacy v0.1.x rows where `requests_hash` was `Some` —
-        // it tries to parse 32 raw bytes of a `B256` as a `HeaderExt`
-        // bitflag + payload and trips a slice-index underflow inside
-        // `u64::from_compact`. Wrap in `catch_unwind` so we can recover.
+        // Try the current (v0.2.x) layout first.
         //
-        // A no-panic but misaligned decode (the random first byte of a
-        // legacy `B256` happens to look like a syntactically-valid
-        // `HeaderExt` bitflag) won't crash, but it will consume the wrong
-        // number of bytes. The `consumed == len` check below catches that
-        // case too.
+        // Two failure modes have to be defended against when the input is
+        // actually a v0.1.x row (where `requests_hash` was a direct
+        // `Option<B256>` field, not `Option<HeaderExt>`):
+        //
+        // 1. **Panic.** The most common case for post-Prague Gnosis
+        //    rows. The auto-derived decoder reads a varuint from the
+        //    first bytes of the legacy `B256` and feeds the resulting
+        //    length into `HeaderExt::from_compact`, which then misreads
+        //    `slot_number`'s u64 length and trips a slice-index
+        //    underflow inside `u64::from_compact`.
+        //
+        // 2. **Misalignment with no panic.** If the leading bytes of the
+        //    legacy `B256` happen to look like a valid varuint + a
+        //    `HeaderExt` bitflag with `slot_number` unset (or with a
+        //    small valid length), v0.2.x decodes without panicking. It
+        //    can NOT be detected by checking `consumed == len`: the
+        //    derived decoder ends with `extra_data: Bytes::from_compact
+        //    (buf, buf.len())` which eats whatever bytes remain, so the
+        //    total always equals `len` regardless of where the field
+        //    boundaries actually are. The semantic check below
+        //    (re-encode and byte-compare) is what catches this case.
+        //
+        // Both failure modes drop through to the v0.1.x fallback.
         let v2_attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let (header, remaining) = CompactHeader::from_compact(buf, len);
-            let consumed = buf.len() - remaining.len();
-            (header, consumed)
+            let (header, _) = CompactHeader::from_compact(buf, len);
+            header
         }));
 
-        if let Ok((header, consumed)) = v2_attempt {
-            if consumed == len {
-                let alloy_header = Self {
-                    parent_hash: header.parent_hash,
-                    ommers_hash: header.ommers_hash,
-                    beneficiary: header.beneficiary,
-                    state_root: header.state_root,
-                    transactions_root: header.transactions_root,
-                    receipts_root: header.receipts_root,
-                    withdrawals_root: header.withdrawals_root,
-                    logs_bloom: header.logs_bloom,
-                    difficulty: header.difficulty,
-                    number: header.number,
-                    gas_limit: header.gas_limit,
-                    gas_used: header.gas_used,
-                    timestamp: header.timestamp,
-                    mix_hash: header.mix_hash,
-                    nonce: header.nonce.map(Into::into),
-                    aura_step: header.aura_step,
-                    aura_seal: header.aura_seal,
-                    base_fee_per_gas: header.base_fee_per_gas,
-                    blob_gas_used: header.blob_gas_used,
-                    excess_blob_gas: header.excess_blob_gas,
-                    parent_beacon_block_root: header.parent_beacon_block_root,
-                    requests_hash: header.extra_fields.as_ref().and_then(|h| h.requests_hash),
-                    block_access_list_hash: header
-                        .extra_fields
-                        .as_ref()
-                        .and_then(|h| h.block_access_list_hash),
-                    slot_number: header.extra_fields.as_ref().and_then(|h| h.slot_number),
-                    extra_data: header.extra_data,
-                };
-                return (alloy_header, &buf[consumed..]);
+        if let Ok(header) = v2_attempt {
+            let alloy_header = Self {
+                parent_hash: header.parent_hash,
+                ommers_hash: header.ommers_hash,
+                beneficiary: header.beneficiary,
+                state_root: header.state_root,
+                transactions_root: header.transactions_root,
+                receipts_root: header.receipts_root,
+                withdrawals_root: header.withdrawals_root,
+                logs_bloom: header.logs_bloom,
+                difficulty: header.difficulty,
+                number: header.number,
+                gas_limit: header.gas_limit,
+                gas_used: header.gas_used,
+                timestamp: header.timestamp,
+                mix_hash: header.mix_hash,
+                nonce: header.nonce.map(Into::into),
+                aura_step: header.aura_step,
+                aura_seal: header.aura_seal,
+                base_fee_per_gas: header.base_fee_per_gas,
+                blob_gas_used: header.blob_gas_used,
+                excess_blob_gas: header.excess_blob_gas,
+                parent_beacon_block_root: header.parent_beacon_block_root,
+                requests_hash: header.extra_fields.as_ref().and_then(|h| h.requests_hash),
+                block_access_list_hash: header
+                    .extra_fields
+                    .as_ref()
+                    .and_then(|h| h.block_access_list_hash),
+                slot_number: header.extra_fields.as_ref().and_then(|h| h.slot_number),
+                extra_data: header.extra_data,
+            };
+
+            // Re-encode the candidate. A real v0.2.x row round-trips
+            // byte-for-byte (the encoder is deterministic and
+            // `HeaderExt::into_option` canonicalises an empty
+            // `HeaderExt` to `None`). A v0.1.x row that happened to
+            // decode without panicking will NOT round-trip — its bytes
+            // came from a different layout.
+            let mut reencoded = Vec::with_capacity(len);
+            let reencoded_len = alloy_header.to_compact(&mut reencoded);
+            if reencoded_len == len && reencoded.as_slice() == &buf[..len] {
+                return (alloy_header, &buf[len..]);
             }
         }
 
@@ -2248,6 +2270,39 @@ mod tests {
             remaining.len(),
         );
         assert_eq!(decoded, original);
+    }
+
+    /// Stress test: confirm the v0.2.x decoder also recovers v0.1.x rows
+    /// where the first byte of `requests_hash` is `0x00`. A `0x00` byte
+    /// looks like a valid single-byte varuint of length 0 to the v0.2.x
+    /// `Option<HeaderExt>::from_compact` path, and a `0x00` `HeaderExt`
+    /// bitflag decodes as "all None" without panicking. Combined with
+    /// `Bytes::from_compact(buf, buf.len())` (which eats the rest of the
+    /// buffer regardless), this makes `consumed == len` a NO-OP check —
+    /// the decoder always reports it consumed everything. The fallback
+    /// must therefore not rely solely on `consumed == len`; semantic
+    /// validation (e.g. round-tripping the re-encoded bytes) is required
+    /// to detect that the v0.2.x interpretation is wrong.
+    #[test]
+    fn legacy_v1_header_with_zero_prefix_requests_hash() {
+        let original = GnosisHeader {
+            requests_hash: Some(B256::ZERO),
+            block_access_list_hash: None,
+            slot_number: None,
+            ..get_sample_post_merge_header()
+        };
+
+        let mut buf = Vec::new();
+        let len = v1_image(&original).to_compact(&mut buf);
+
+        let (decoded, _) = GnosisHeader::from_compact(&buf, len);
+        assert_eq!(
+            decoded, original,
+            "decoder must recover requests_hash; \
+             v0.2.x layout misreads `Option<HeaderExt>` from leading 0x00 \
+             bytes without panicking, so the fallback path needs a check \
+             stronger than `consumed == len`",
+        );
     }
 
     /// New extension fields (post-Osaka: `block_access_list_hash`,
