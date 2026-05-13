@@ -808,12 +808,23 @@ impl Decodable for GnosisHeader {
 
 // On-disk compact layout for `GnosisHeader`.
 //
-// The bitflag prefix is frozen at 4 bytes (32 bits, 0 unused) to stay
-// byte-compatible with databases produced by gnosis-primitives v0.1.x.
-// `extra_fields` occupies the same 1-bit slot that v0.1.x used for
-// `requests_hash`, mirroring the trick used by upstream reth in
-// paradigmxyz/reth#11166: any future header field MUST be added inside
-// `HeaderExt`, not to this struct.
+// Encoding (`to_compact`) always writes this v0.2.x layout: the bitflag
+// prefix is 4 bytes (32 bits, 0 unused) and the last 1-bit slot is
+// `Option<HeaderExt>`, mirroring upstream reth's
+// paradigmxyz/reth#11166 trick. Any future header field MUST go inside
+// `HeaderExt`, not directly on this struct, so the parent bitflag stays
+// stable.
+//
+// Decoding (`from_compact`) is layout-tolerant — see the implementation
+// for `GnosisHeader` below. It first tries this layout, and if that
+// fails (panic) or the byte counts don't line up, falls back to
+// `CompactHeaderV1` (gnosis-primitives v0.1.x's layout, where the same
+// 1-bit slot was `Option<B256>` for `requests_hash`). The two payloads
+// are NOT byte-compatible when the bit is set, contrary to the original
+// claim of this comment — see the regression tests at the bottom of this
+// file. The v0.1.x fallback is what lets nodes upgraded from old
+// reth_gnosis releases keep reading their post-Prague headers without a
+// resync.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize, Compact)]
 struct CompactHeader {
     parent_hash: B256,
@@ -869,6 +880,48 @@ impl HeaderExt {
     }
 }
 
+// Legacy on-disk compact layout matching gnosis-primitives v0.1.x. Used by
+// `GnosisHeader::from_compact` as a fallback when the v0.2.x layout fails
+// to decode (which happens for any v0.1.x-written row where
+// `requests_hash` was `Some`). Also used by regression tests to fabricate
+// real v0.1.x bytes.
+//
+// The bit at the same position as `CompactHeader::extra_fields` (v0.2.x)
+// is `requests_hash` here. When the bit is set:
+//   * v0.1.x layout: 32 raw bytes of `B256` follow
+//   * v0.2.x layout: 1 byte `HeaderExt` bitflag + variable payload follows
+// Same bit, incompatible payloads — that's the whole bug.
+//
+// New fields like `block_access_list_hash` / `slot_number` don't exist in
+// this layout; on the decode path they're set to `None` for rows that
+// only the v0.1.x decoder can read.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize, Compact)]
+struct CompactHeaderV1 {
+    parent_hash: B256,
+    ommers_hash: B256,
+    beneficiary: Address,
+    state_root: B256,
+    transactions_root: B256,
+    receipts_root: B256,
+    withdrawals_root: Option<B256>,
+    logs_bloom: Bloom,
+    difficulty: U256,
+    number: BlockNumber,
+    gas_limit: u64,
+    gas_used: u64,
+    timestamp: u64,
+    mix_hash: Option<B256>,
+    nonce: Option<u64>,
+    aura_step: Option<U256>,
+    aura_seal: Option<FixedBytes<65>>,
+    base_fee_per_gas: Option<u64>,
+    blob_gas_used: Option<u64>,
+    excess_blob_gas: Option<u64>,
+    parent_beacon_block_root: Option<B256>,
+    requests_hash: Option<B256>,
+    extra_data: Bytes,
+}
+
 impl reth_codecs::Compact for GnosisHeader {
     fn to_compact<B>(&self, buf: &mut B) -> usize
     where
@@ -908,38 +961,91 @@ impl reth_codecs::Compact for GnosisHeader {
     }
 
     fn from_compact(buf: &[u8], len: usize) -> (Self, &[u8]) {
-        let (header, buf) = CompactHeader::from_compact(buf, len);
+        // Try the current (v0.2.x) layout first. The auto-derived decoder
+        // panics on legacy v0.1.x rows where `requests_hash` was `Some` —
+        // it tries to parse 32 raw bytes of a `B256` as a `HeaderExt`
+        // bitflag + payload and trips a slice-index underflow inside
+        // `u64::from_compact`. Wrap in `catch_unwind` so we can recover.
+        //
+        // A no-panic but misaligned decode (the random first byte of a
+        // legacy `B256` happens to look like a syntactically-valid
+        // `HeaderExt` bitflag) won't crash, but it will consume the wrong
+        // number of bytes. The `consumed == len` check below catches that
+        // case too.
+        let v2_attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (header, remaining) = CompactHeader::from_compact(buf, len);
+            let consumed = buf.len() - remaining.len();
+            (header, consumed)
+        }));
+
+        if let Ok((header, consumed)) = v2_attempt {
+            if consumed == len {
+                let alloy_header = Self {
+                    parent_hash: header.parent_hash,
+                    ommers_hash: header.ommers_hash,
+                    beneficiary: header.beneficiary,
+                    state_root: header.state_root,
+                    transactions_root: header.transactions_root,
+                    receipts_root: header.receipts_root,
+                    withdrawals_root: header.withdrawals_root,
+                    logs_bloom: header.logs_bloom,
+                    difficulty: header.difficulty,
+                    number: header.number,
+                    gas_limit: header.gas_limit,
+                    gas_used: header.gas_used,
+                    timestamp: header.timestamp,
+                    mix_hash: header.mix_hash,
+                    nonce: header.nonce.map(Into::into),
+                    aura_step: header.aura_step,
+                    aura_seal: header.aura_seal,
+                    base_fee_per_gas: header.base_fee_per_gas,
+                    blob_gas_used: header.blob_gas_used,
+                    excess_blob_gas: header.excess_blob_gas,
+                    parent_beacon_block_root: header.parent_beacon_block_root,
+                    requests_hash: header.extra_fields.as_ref().and_then(|h| h.requests_hash),
+                    block_access_list_hash: header
+                        .extra_fields
+                        .as_ref()
+                        .and_then(|h| h.block_access_list_hash),
+                    slot_number: header.extra_fields.as_ref().and_then(|h| h.slot_number),
+                    extra_data: header.extra_data,
+                };
+                return (alloy_header, &buf[consumed..]);
+            }
+        }
+
+        // Fallback: legacy gnosis-primitives v0.1.x layout. `requests_hash`
+        // is a direct field; the post-Prague fields that v0.1.x didn't know
+        // about (`block_access_list_hash`, `slot_number`) default to `None`.
+        let (header_v1, remaining) = CompactHeaderV1::from_compact(buf, len);
         let alloy_header = Self {
-            parent_hash: header.parent_hash,
-            ommers_hash: header.ommers_hash,
-            beneficiary: header.beneficiary,
-            state_root: header.state_root,
-            transactions_root: header.transactions_root,
-            receipts_root: header.receipts_root,
-            withdrawals_root: header.withdrawals_root,
-            logs_bloom: header.logs_bloom,
-            difficulty: header.difficulty,
-            number: header.number,
-            gas_limit: header.gas_limit,
-            gas_used: header.gas_used,
-            timestamp: header.timestamp,
-            mix_hash: header.mix_hash,
-            nonce: header.nonce.map(Into::into),
-            aura_step: header.aura_step,
-            aura_seal: header.aura_seal,
-            base_fee_per_gas: header.base_fee_per_gas,
-            blob_gas_used: header.blob_gas_used,
-            excess_blob_gas: header.excess_blob_gas,
-            parent_beacon_block_root: header.parent_beacon_block_root,
-            requests_hash: header.extra_fields.as_ref().and_then(|h| h.requests_hash),
-            block_access_list_hash: header
-                .extra_fields
-                .as_ref()
-                .and_then(|h| h.block_access_list_hash),
-            slot_number: header.extra_fields.as_ref().and_then(|h| h.slot_number),
-            extra_data: header.extra_data,
+            parent_hash: header_v1.parent_hash,
+            ommers_hash: header_v1.ommers_hash,
+            beneficiary: header_v1.beneficiary,
+            state_root: header_v1.state_root,
+            transactions_root: header_v1.transactions_root,
+            receipts_root: header_v1.receipts_root,
+            withdrawals_root: header_v1.withdrawals_root,
+            logs_bloom: header_v1.logs_bloom,
+            difficulty: header_v1.difficulty,
+            number: header_v1.number,
+            gas_limit: header_v1.gas_limit,
+            gas_used: header_v1.gas_used,
+            timestamp: header_v1.timestamp,
+            mix_hash: header_v1.mix_hash,
+            nonce: header_v1.nonce.map(Into::into),
+            aura_step: header_v1.aura_step,
+            aura_seal: header_v1.aura_seal,
+            base_fee_per_gas: header_v1.base_fee_per_gas,
+            blob_gas_used: header_v1.blob_gas_used,
+            excess_blob_gas: header_v1.excess_blob_gas,
+            parent_beacon_block_root: header_v1.parent_beacon_block_root,
+            requests_hash: header_v1.requests_hash,
+            block_access_list_hash: None,
+            slot_number: None,
+            extra_data: header_v1.extra_data,
         };
-        (alloy_header, buf)
+        (alloy_header, remaining)
     }
 }
 
@@ -2076,5 +2182,96 @@ mod tests {
         let mut header = get_sample_post_merge_header();
         header.set_number(42);
         assert_eq!(header.number, 42);
+    }
+
+    // Helper: build a `CompactHeaderV1` whose fields mirror `header`, so
+    // we can produce real v0.1.x-shaped bytes from the test module.
+    fn v1_image(header: &GnosisHeader) -> CompactHeaderV1 {
+        CompactHeaderV1 {
+            parent_hash: header.parent_hash,
+            ommers_hash: header.ommers_hash,
+            beneficiary: header.beneficiary,
+            state_root: header.state_root,
+            transactions_root: header.transactions_root,
+            receipts_root: header.receipts_root,
+            withdrawals_root: header.withdrawals_root,
+            logs_bloom: header.logs_bloom,
+            difficulty: header.difficulty,
+            number: header.number,
+            gas_limit: header.gas_limit,
+            gas_used: header.gas_used,
+            timestamp: header.timestamp,
+            mix_hash: header.mix_hash,
+            nonce: header.nonce.map(|n| n.into()),
+            aura_step: header.aura_step,
+            aura_seal: header.aura_seal,
+            base_fee_per_gas: header.base_fee_per_gas,
+            blob_gas_used: header.blob_gas_used,
+            excess_blob_gas: header.excess_blob_gas,
+            parent_beacon_block_root: header.parent_beacon_block_root,
+            requests_hash: header.requests_hash,
+            extra_data: header.extra_data.clone(),
+        }
+    }
+
+    /// Regression for the v0.2.3 codec bug. Datadirs synced by reth_gnosis
+    /// releases that used gnosis-primitives v0.1.x stored post-Prague
+    /// headers with `requests_hash: Some(_)` written directly as 32 raw
+    /// bytes after the parent bitflag. v0.2.3 expected a `HeaderExt`
+    /// encoding (1-byte bitflag + variable payload) at that position and
+    /// crashed in `HeaderExt::from_compact` → `u64::from_compact`. The new
+    /// `from_compact` must recognise the v0.1.x shape and decode it
+    /// without panicking.
+    #[test]
+    fn legacy_v1_post_prague_header_decodes() {
+        // Realistic post-Prague header: `requests_hash` is Some (this is
+        // the case that used to panic). New extension fields are absent,
+        // because v0.1.x didn't know about them.
+        let original = GnosisHeader {
+            requests_hash: Some(b256!(
+                "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+            )),
+            block_access_list_hash: None,
+            slot_number: None,
+            ..get_sample_post_merge_header()
+        };
+
+        // Encode using the v0.1.x layout (CompactHeaderV1) to produce
+        // bytes that match what a pre-v0.2 release would have written.
+        let mut buf = Vec::new();
+        let len = v1_image(&original).to_compact(&mut buf);
+
+        let (decoded, remaining) = GnosisHeader::from_compact(&buf, len);
+        assert!(
+            remaining.is_empty(),
+            "decoder over-/under-consumed: remaining = {} bytes",
+            remaining.len(),
+        );
+        assert_eq!(decoded, original);
+    }
+
+    /// New extension fields (post-Osaka: `block_access_list_hash`,
+    /// `slot_number`) only exist in the v0.2.x layout. They must
+    /// round-trip via the v2 path — they don't exist in v0.1.x at all and
+    /// can't be expressed by `CompactHeaderV1`.
+    #[test]
+    fn v2_header_with_all_extension_fields_roundtrips() {
+        let original = GnosisHeader {
+            requests_hash: Some(b256!(
+                "1111111111111111111111111111111111111111111111111111111111111111"
+            )),
+            block_access_list_hash: Some(b256!(
+                "2222222222222222222222222222222222222222222222222222222222222222"
+            )),
+            slot_number: Some(0x0123_4567_89ab_cdef),
+            ..get_sample_post_merge_header()
+        };
+
+        let mut buf = Vec::new();
+        let len = original.to_compact(&mut buf);
+
+        let (decoded, remaining) = GnosisHeader::from_compact(&buf, len);
+        assert!(remaining.is_empty());
+        assert_eq!(decoded, original);
     }
 }
