@@ -43,6 +43,8 @@ fn create_gnosis_post_merge_header() -> GnosisHeader {
         excess_blob_gas: Some(2_621_440),
         parent_beacon_block_root: Some(B256::random()),
         requests_hash: Some(B256::random()),
+        block_access_list_hash: None,
+        slot_number: None,
     }
 }
 
@@ -71,6 +73,8 @@ fn create_gnosis_pre_merge_header() -> GnosisHeader {
         excess_blob_gas: None,
         parent_beacon_block_root: None,
         requests_hash: None,
+        block_access_list_hash: None,
+        slot_number: None,
     }
 }
 
@@ -97,6 +101,8 @@ fn create_alloy_header() -> Header {
         excess_blob_gas: Some(2_621_440),
         parent_beacon_block_root: Some(B256::random()),
         requests_hash: Some(B256::random()),
+        block_access_list_hash: None,
+        slot_number: None,
     }
 }
 
@@ -425,6 +431,49 @@ fn bench_decompress(c: &mut Criterion) {
     group.finish();
 }
 
+// Isolates the cost of the v0.1.x-compat wrapper added in v0.2.4. The
+// pre-fix decoder was effectively `CompactHeader::from_compact` (the
+// auto-derived path); the post-fix decoder wraps it in
+// `catch_unwind` + a re-encode/byte-compare for semantic validation.
+// Both bench fns decode the same canonical v0.2.x bytes, so the delta
+// between them is the overhead the fix imposes on the happy path.
+fn bench_decode_overhead_of_compat_wrapper(c: &mut Criterion) {
+    use reth_codecs::Compact as _;
+
+    let mut group = c.benchmark_group("Decode (pre-fix vs post-fix)");
+    configure_benchmark_group(&mut group);
+
+    // Use the public alloy header type as a stand-in for "pre-fix": its
+    // CompactHeader is the same shape, and `Header::from_compact` is what
+    // GnosisHeader::from_compact looked like before v0.2.4.
+    let alloy_header = create_alloy_header();
+    let mut alloy_buf = Vec::new();
+    let alloy_len = alloy_header.to_compact(&mut alloy_buf);
+
+    let gnosis_post = create_gnosis_post_merge_header();
+    let mut gnosis_buf = Vec::new();
+    let gnosis_len = gnosis_post.to_compact(&mut gnosis_buf);
+
+    group.bench_function(
+        "PRE-FIX baseline: alloy_consensus::Header::from_compact",
+        |b| {
+            b.iter(|| {
+                let (h, _) = Header::from_compact(&alloy_buf, alloy_len);
+                black_box(h);
+            })
+        },
+    );
+
+    group.bench_function("POST-FIX: GnosisHeader::from_compact", |b| {
+        b.iter(|| {
+            let (h, _) = GnosisHeader::from_compact(&gnosis_buf, gnosis_len);
+            black_box(h);
+        })
+    });
+
+    group.finish();
+}
+
 fn bench_compression_roundtrip(c: &mut Criterion) {
     let mut group = c.benchmark_group("Compression Roundtrip (Compress + Decompress)");
     configure_benchmark_group(&mut group);
@@ -644,7 +693,8 @@ criterion_group!(
     compact_benches,
     bench_compact_encode,
     bench_compact_decode,
-    bench_compact_roundtrip
+    bench_compact_roundtrip,
+    bench_decode_overhead_of_compat_wrapper
 );
 
 criterion_group!(

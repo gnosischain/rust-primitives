@@ -806,25 +806,16 @@ impl Decodable for GnosisHeader {
     }
 }
 
-// On-disk compact layout for `GnosisHeader`.
+// TODO TO DROP-V1 SUPPORT:
+// remove `CompactHeaderV1` + the round-trip / fallback branch in `GnosisHeader::from_compact`,
+// and revert `HeaderExt` to `#[derive(Compact)]` (the manual impl exists only
+// to keep that decode path panic-free against legacy bytes).
 //
-// Encoding (`to_compact`) always writes this v0.2.x layout: the bitflag
-// prefix is 4 bytes (32 bits, 0 unused) and the last 1-bit slot is
-// `Option<HeaderExt>`, mirroring upstream reth's
-// paradigmxyz/reth#11166 trick. Any future header field MUST go inside
-// `HeaderExt`, not directly on this struct, so the parent bitflag stays
-// stable.
-//
-// Decoding (`from_compact`) is layout-tolerant — see the implementation
-// for `GnosisHeader` below. It first tries this layout, and if that
-// fails (panic) or the byte counts don't line up, falls back to
-// `CompactHeaderV1` (gnosis-primitives v0.1.x's layout, where the same
-// 1-bit slot was `Option<B256>` for `requests_hash`). The two payloads
-// are NOT byte-compatible when the bit is set, contrary to the original
-// claim of this comment — see the regression tests at the bottom of this
-// file. The v0.1.x fallback is what lets nodes upgraded from old
-// reth_gnosis releases keep reading their post-Prague headers without a
-// resync.
+// v0.2.x on-disk layout. `to_compact` always writes this; `from_compact`
+// (on `GnosisHeader`) tries this first and falls back to `CompactHeaderV1`
+// if it can't validate. New header fields must go inside `HeaderExt`, not
+// here, so the 4-byte parent bitflag stays stable
+// (paradigmxyz/reth#11166).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize, Compact)]
 struct CompactHeader {
     parent_hash: B256,
@@ -852,13 +843,19 @@ struct CompactHeader {
     extra_data: Bytes,
 }
 
-/// Extension fields for [`CompactHeader`].
+/// Extension slot for new header fields, hidden behind a single
+/// `Option<HeaderExt>` bit on `CompactHeader` so the parent bitflag layout
+/// stays frozen.
 ///
-/// New header fields go here, never on [`CompactHeader`] directly, so the
-/// parent bitflag layout stays stable. Old rows (where every field on this
-/// struct would be `None`) encode as `extra_fields: None` and round-trip
-/// byte-identically with the v0.1.x layout.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize, Compact)]
+/// `Compact` is hand-written (rather than derived) so `from_compact`
+/// validates lengths instead of panicking on malformed input. The wire
+/// format is byte-identical to what the derive would emit (verified
+/// empirically): a 1-byte bitflag (bit 0 = requests_hash, bit 1 =
+/// block_access_list_hash, bit 2 = slot_number, bits 3-7 = 0), followed
+/// by each `Some` field's payload in declaration order. Without this,
+/// v0.1.x rows feeding garbage into `slot_number`'s u64-length varuint
+/// would underflow inside `u64::from_compact`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 struct HeaderExt {
     requests_hash: Option<B256>,
     block_access_list_hash: Option<B256>,
@@ -866,8 +863,9 @@ struct HeaderExt {
 }
 
 impl HeaderExt {
-    /// Collapses an all-`None` `HeaderExt` to `None`, so that headers with
-    /// no extension fields encode byte-identically to legacy rows.
+    /// Canonicalise: all-`None` HeaderExt → `None`, so encoder output is
+    /// deterministic (required for the re-encode check in
+    /// `GnosisHeader::from_compact`).
     const fn into_option(self) -> Option<Self> {
         if self.requests_hash.is_some()
             || self.block_access_list_hash.is_some()
@@ -880,21 +878,133 @@ impl HeaderExt {
     }
 }
 
-// Legacy on-disk compact layout matching gnosis-primitives v0.1.x. Used by
-// `GnosisHeader::from_compact` as a fallback when the v0.2.x layout fails
-// to decode (which happens for any v0.1.x-written row where
-// `requests_hash` was `Some`). Also used by regression tests to fabricate
-// real v0.1.x bytes.
-//
-// The bit at the same position as `CompactHeader::extra_fields` (v0.2.x)
-// is `requests_hash` here. When the bit is set:
-//   * v0.1.x layout: 32 raw bytes of `B256` follow
-//   * v0.2.x layout: 1 byte `HeaderExt` bitflag + variable payload follows
-// Same bit, incompatible payloads — that's the whole bug.
-//
-// New fields like `block_access_list_hash` / `slot_number` don't exist in
-// this layout; on the decode path they're set to `None` for rows that
-// only the v0.1.x decoder can read.
+/// Following varuint functions are copied from reth
+
+/// Mirror of reth-codecs' private `encode_varuint`.
+fn encode_varuint_local<B: alloy_rlp::bytes::BufMut>(mut n: usize, buf: &mut B) {
+    while n >= 0x80 {
+        buf.put_u8((n as u8) | 0x80);
+        n >>= 7;
+    }
+    buf.put_u8(n as u8);
+}
+
+/// Bytes a `usize` needs in the varuint encoding above.
+fn varuint_len_local(mut n: usize) -> usize {
+    let mut len = 1;
+    while n >= 0x80 {
+        len += 1;
+        n >>= 7;
+    }
+    len
+}
+
+/// Bounds-checked counterpart to reth-codecs' `decode_varuint`. Returns
+/// `None` on truncation or overflow instead of panicking.
+fn decode_varuint_local(buf: &[u8]) -> Option<(usize, &[u8])> {
+    let mut value: usize = 0;
+    // usize is at most 64 bits → 10 varuint bytes covers any valid value.
+    let max = buf.len().min(10);
+    for i in 0..max {
+        let byte = buf[i];
+        let shift = i.checked_mul(7)?;
+        if shift >= usize::BITS as usize {
+            return None;
+        }
+        value |= (usize::from(byte & 0x7F)).checked_shl(shift as u32)?;
+        if byte < 0x80 {
+            return Some((value, &buf[i + 1..]));
+        }
+    }
+    None
+}
+
+// This impl is same as paradigm's:
+// reth_codecs_derive::compact::flags::build_struct_field_flags
+// reth-codecs-0.3.1/src/lib.rs:302-365
+impl reth_codecs::Compact for HeaderExt {
+    fn to_compact<B>(&self, buf: &mut B) -> usize
+    where
+        B: alloy_rlp::bytes::BufMut + AsMut<[u8]>,
+    {
+        let mut bitflag = 0u8;
+        if self.requests_hash.is_some() {
+            bitflag |= 0b001;
+        }
+        if self.block_access_list_hash.is_some() {
+            bitflag |= 0b010;
+        }
+        if self.slot_number.is_some() {
+            bitflag |= 0b100;
+        }
+        buf.put_u8(bitflag);
+        let mut total = 1;
+
+        if let Some(rh) = self.requests_hash {
+            buf.put_slice(rh.as_slice());
+            total += 32;
+        }
+        if let Some(bah) = self.block_access_list_hash {
+            buf.put_slice(bah.as_slice());
+            total += 32;
+        }
+        if let Some(sn) = self.slot_number {
+            // Mirror `Option<u64>` generic encoding: varuint(byte-length) +
+            // big-endian bytes with leading zeros stripped.
+            let leading = (sn.leading_zeros() / 8) as usize;
+            let length = 8 - leading;
+            encode_varuint_local(length, buf);
+            buf.put_slice(&sn.to_be_bytes()[leading..]);
+            total += varuint_len_local(length) + length;
+        }
+
+        total
+    }
+
+    fn from_compact(buf: &[u8], _len: usize) -> (Self, &[u8]) {
+        // Malformed-input policy: stop early and return the partial
+        // `HeaderExt`. `GnosisHeader::from_compact`'s re-encode check
+        // will reject the result and fall back to the v0.1.x decoder.
+        let Some((&bitflag, mut buf)) = buf.split_first() else {
+            return (HeaderExt::default(), buf);
+        };
+        let mut hx = HeaderExt::default();
+
+        if bitflag & 0b001 != 0 {
+            if buf.len() < 32 {
+                return (hx, buf);
+            }
+            hx.requests_hash = Some(B256::from_slice(&buf[..32]));
+            buf = &buf[32..];
+        }
+        if bitflag & 0b010 != 0 {
+            if buf.len() < 32 {
+                return (hx, buf);
+            }
+            hx.block_access_list_hash = Some(B256::from_slice(&buf[..32]));
+            buf = &buf[32..];
+        }
+        if bitflag & 0b100 != 0 {
+            let Some((length, rest)) = decode_varuint_local(buf) else {
+                return (hx, buf);
+            };
+            if length > 8 || rest.len() < length {
+                return (hx, buf);
+            }
+            let mut arr = [0u8; 8];
+            arr[8 - length..].copy_from_slice(&rest[..length]);
+            hx.slot_number = Some(u64::from_be_bytes(arr));
+            buf = &rest[length..];
+        }
+
+        (hx, buf)
+    }
+}
+
+// Legacy v0.1.x layout. Same parent-bitflag bit positions as
+// `CompactHeader`, but the last bit's payload differs: v0.1.x writes 32
+// raw bytes of `B256` (`requests_hash`); v0.2.x writes a varuint + a
+// `HeaderExt` encoding. Fallback decoder for rows written before v0.2.x.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize, Compact)]
 struct CompactHeaderV1 {
     parent_hash: B256,
@@ -961,84 +1071,54 @@ impl reth_codecs::Compact for GnosisHeader {
     }
 
     fn from_compact(buf: &[u8], len: usize) -> (Self, &[u8]) {
-        // Try the current (v0.2.x) layout first.
-        //
-        // Two failure modes have to be defended against when the input is
-        // actually a v0.1.x row (where `requests_hash` was a direct
-        // `Option<B256>` field, not `Option<HeaderExt>`):
-        //
-        // 1. **Panic.** The most common case for post-Prague Gnosis
-        //    rows. The auto-derived decoder reads a varuint from the
-        //    first bytes of the legacy `B256` and feeds the resulting
-        //    length into `HeaderExt::from_compact`, which then misreads
-        //    `slot_number`'s u64 length and trips a slice-index
-        //    underflow inside `u64::from_compact`.
-        //
-        // 2. **Misalignment with no panic.** If the leading bytes of the
-        //    legacy `B256` happen to look like a valid varuint + a
-        //    `HeaderExt` bitflag with `slot_number` unset (or with a
-        //    small valid length), v0.2.x decodes without panicking. It
-        //    can NOT be detected by checking `consumed == len`: the
-        //    derived decoder ends with `extra_data: Bytes::from_compact
-        //    (buf, buf.len())` which eats whatever bytes remain, so the
-        //    total always equals `len` regardless of where the field
-        //    boundaries actually are. The semantic check below
-        //    (re-encode and byte-compare) is what catches this case.
-        //
-        // Both failure modes drop through to the v0.1.x fallback.
-        let v2_attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let (header, _) = CompactHeader::from_compact(buf, len);
-            header
-        }));
+        // Try v0.2.x first; fall back to v0.1.x if the result doesn't
+        // round-trip. The v0.2.x decoder is panic-free because `HeaderExt`
+        // has a hand-written `Compact` impl that bounds-checks (see
+        // above) — it returns a partial `HeaderExt` on malformed input
+        // rather than tripping the u64 length underflow that the
+        // auto-derive would. The round-trip check catches both partial
+        // decodes and legitimate-looking-but-wrong v0.1.x payloads.
+        let (header, _) = CompactHeader::from_compact(buf, len);
+        let alloy_header = Self {
+            parent_hash: header.parent_hash,
+            ommers_hash: header.ommers_hash,
+            beneficiary: header.beneficiary,
+            state_root: header.state_root,
+            transactions_root: header.transactions_root,
+            receipts_root: header.receipts_root,
+            withdrawals_root: header.withdrawals_root,
+            logs_bloom: header.logs_bloom,
+            difficulty: header.difficulty,
+            number: header.number,
+            gas_limit: header.gas_limit,
+            gas_used: header.gas_used,
+            timestamp: header.timestamp,
+            mix_hash: header.mix_hash,
+            nonce: header.nonce.map(Into::into),
+            aura_step: header.aura_step,
+            aura_seal: header.aura_seal,
+            base_fee_per_gas: header.base_fee_per_gas,
+            blob_gas_used: header.blob_gas_used,
+            excess_blob_gas: header.excess_blob_gas,
+            parent_beacon_block_root: header.parent_beacon_block_root,
+            requests_hash: header.extra_fields.as_ref().and_then(|h| h.requests_hash),
+            block_access_list_hash: header
+                .extra_fields
+                .as_ref()
+                .and_then(|h| h.block_access_list_hash),
+            slot_number: header.extra_fields.as_ref().and_then(|h| h.slot_number),
+            extra_data: header.extra_data,
+        };
 
-        if let Ok(header) = v2_attempt {
-            let alloy_header = Self {
-                parent_hash: header.parent_hash,
-                ommers_hash: header.ommers_hash,
-                beneficiary: header.beneficiary,
-                state_root: header.state_root,
-                transactions_root: header.transactions_root,
-                receipts_root: header.receipts_root,
-                withdrawals_root: header.withdrawals_root,
-                logs_bloom: header.logs_bloom,
-                difficulty: header.difficulty,
-                number: header.number,
-                gas_limit: header.gas_limit,
-                gas_used: header.gas_used,
-                timestamp: header.timestamp,
-                mix_hash: header.mix_hash,
-                nonce: header.nonce.map(Into::into),
-                aura_step: header.aura_step,
-                aura_seal: header.aura_seal,
-                base_fee_per_gas: header.base_fee_per_gas,
-                blob_gas_used: header.blob_gas_used,
-                excess_blob_gas: header.excess_blob_gas,
-                parent_beacon_block_root: header.parent_beacon_block_root,
-                requests_hash: header.extra_fields.as_ref().and_then(|h| h.requests_hash),
-                block_access_list_hash: header
-                    .extra_fields
-                    .as_ref()
-                    .and_then(|h| h.block_access_list_hash),
-                slot_number: header.extra_fields.as_ref().and_then(|h| h.slot_number),
-                extra_data: header.extra_data,
-            };
-
-            // Re-encode the candidate. A real v0.2.x row round-trips
-            // byte-for-byte (the encoder is deterministic and
-            // `HeaderExt::into_option` canonicalises an empty
-            // `HeaderExt` to `None`). A v0.1.x row that happened to
-            // decode without panicking will NOT round-trip — its bytes
-            // came from a different layout.
-            let mut reencoded = Vec::with_capacity(len);
-            let reencoded_len = alloy_header.to_compact(&mut reencoded);
-            if reencoded_len == len && reencoded.as_slice() == &buf[..len] {
-                return (alloy_header, &buf[len..]);
-            }
+        // Round-trip check: canonical v0.2.x rows re-encode byte-for-byte;
+        // a v0.1.x row that snuck through the v2 decoder won't.
+        let mut reencoded = Vec::with_capacity(len);
+        let reencoded_len = alloy_header.to_compact(&mut reencoded);
+        if reencoded_len == len && reencoded.as_slice() == &buf[..len] {
+            return (alloy_header, &buf[len..]);
         }
 
-        // Fallback: legacy gnosis-primitives v0.1.x layout. `requests_hash`
-        // is a direct field; the post-Prague fields that v0.1.x didn't know
-        // about (`block_access_list_hash`, `slot_number`) default to `None`.
+        // Fallback: v0.1.x layout. New fields default to `None`.
         let (header_v1, remaining) = CompactHeaderV1::from_compact(buf, len);
         let alloy_header = Self {
             parent_hash: header_v1.parent_hash,
@@ -1205,7 +1285,8 @@ mod tests {
             "CompactHeader bitflag size must not change — add new fields to HeaderExt instead",
         );
         assert_eq!(CompactHeader::bitflag_unused_bits(), 0);
-        assert_eq!(HeaderExt::bitflag_encoded_bytes(), 1);
+        // HeaderExt's 1-byte bitflag is pinned separately by
+        // `headerext_byte_layout_is_stable` against the exact wire bytes.
     }
 
     #[test]
@@ -2206,8 +2287,7 @@ mod tests {
         assert_eq!(header.number, 42);
     }
 
-    // Helper: build a `CompactHeaderV1` whose fields mirror `header`, so
-    // we can produce real v0.1.x-shaped bytes from the test module.
+    // Produces real v0.1.x bytes for a given GnosisHeader.
     fn v1_image(header: &GnosisHeader) -> CompactHeaderV1 {
         CompactHeaderV1 {
             parent_hash: header.parent_hash,
@@ -2236,14 +2316,8 @@ mod tests {
         }
     }
 
-    /// Regression for the v0.2.3 codec bug. Datadirs synced by reth_gnosis
-    /// releases that used gnosis-primitives v0.1.x stored post-Prague
-    /// headers with `requests_hash: Some(_)` written directly as 32 raw
-    /// bytes after the parent bitflag. v0.2.3 expected a `HeaderExt`
-    /// encoding (1-byte bitflag + variable payload) at that position and
-    /// crashed in `HeaderExt::from_compact` → `u64::from_compact`. The new
-    /// `from_compact` must recognise the v0.1.x shape and decode it
-    /// without panicking.
+    /// Regression: v0.1.x rows with `requests_hash: Some` (every post-Prague
+    /// Gnosis header) must decode without panicking after the v0.2.x bump.
     #[test]
     fn legacy_v1_post_prague_header_decodes() {
         // Realistic post-Prague header: `requests_hash` is Some (this is
@@ -2272,17 +2346,10 @@ mod tests {
         assert_eq!(decoded, original);
     }
 
-    /// Stress test: confirm the v0.2.x decoder also recovers v0.1.x rows
-    /// where the first byte of `requests_hash` is `0x00`. A `0x00` byte
-    /// looks like a valid single-byte varuint of length 0 to the v0.2.x
-    /// `Option<HeaderExt>::from_compact` path, and a `0x00` `HeaderExt`
-    /// bitflag decodes as "all None" without panicking. Combined with
-    /// `Bytes::from_compact(buf, buf.len())` (which eats the rest of the
-    /// buffer regardless), this makes `consumed == len` a NO-OP check —
-    /// the decoder always reports it consumed everything. The fallback
-    /// must therefore not rely solely on `consumed == len`; semantic
-    /// validation (e.g. round-tripping the re-encoded bytes) is required
-    /// to detect that the v0.2.x interpretation is wrong.
+    /// Stress test: `requests_hash = Some(B256::ZERO)` is the case where v0.2.x
+    /// decodes *without* panicking but with the wrong fields (the leading
+    /// `0x00` looks like a valid empty `HeaderExt` encoding). Pins the
+    /// round-trip check — `consumed == len` alone wouldn't catch this.
     #[test]
     fn legacy_v1_header_with_zero_prefix_requests_hash() {
         let original = GnosisHeader {
@@ -2305,10 +2372,69 @@ mod tests {
         );
     }
 
-    /// New extension fields (post-Osaka: `block_access_list_hash`,
-    /// `slot_number`) only exist in the v0.2.x layout. They must
-    /// round-trip via the v2 path — they don't exist in v0.1.x at all and
-    /// can't be expressed by `CompactHeaderV1`.
+    /// Pins the byte layout of `HeaderExt::to_compact` against the bytes
+    /// the auto-derive used to emit. If the manual impl ever drifts from
+    /// that layout, the next read against an existing static-file row
+    /// will mis-decode silently — this test catches that before release.
+    #[test]
+    fn headerext_byte_layout_is_stable() {
+        use reth_codecs::Compact;
+
+        fn encode(h: HeaderExt) -> Vec<u8> {
+            let mut buf = Vec::new();
+            h.to_compact(&mut buf);
+            buf
+        }
+
+        // bitflag 0x01 + 32-byte B256.
+        let mut expected = vec![0x01];
+        expected.extend_from_slice(&[0xaa; 32]);
+        assert_eq!(
+            encode(HeaderExt {
+                requests_hash: Some(B256::from([0xaa; 32])),
+                block_access_list_hash: None,
+                slot_number: None,
+            }),
+            expected,
+        );
+
+        // bitflag 0x04 + varuint(1) + one u64 byte.
+        assert_eq!(
+            encode(HeaderExt {
+                requests_hash: None,
+                block_access_list_hash: None,
+                slot_number: Some(42),
+            }),
+            vec![0x04, 0x01, 0x2a],
+        );
+
+        // bitflag 0x04 + varuint(8) + all 8 u64 bytes.
+        assert_eq!(
+            encode(HeaderExt {
+                requests_hash: None,
+                block_access_list_hash: None,
+                slot_number: Some(0x1234_5678_90ab_cdef),
+            }),
+            vec![0x04, 0x08, 0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef],
+        );
+
+        // bitflag 0x07 + B256 + B256 + varuint(2) + 2 u64 bytes.
+        let mut expected = vec![0x07];
+        expected.extend_from_slice(&[0xaa; 32]);
+        expected.extend_from_slice(&[0xbb; 32]);
+        expected.extend_from_slice(&[0x02, 0xca, 0xfe]);
+        assert_eq!(
+            encode(HeaderExt {
+                requests_hash: Some(B256::from([0xaa; 32])),
+                block_access_list_hash: Some(B256::from([0xbb; 32])),
+                slot_number: Some(0xcafe),
+            }),
+            expected,
+        );
+    }
+
+    /// v0.2.x rows with every extension field populated (post-Osaka shape)
+    /// must still round-trip via the v2 path.
     #[test]
     fn v2_header_with_all_extension_fields_roundtrips() {
         let original = GnosisHeader {
