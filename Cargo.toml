@@ -4,11 +4,11 @@ version = "0.2.7"
 edition = "2024"
 
 [dependencies]
-reth = { git = "https://github.com/paradigmxyz/reth", tag = "v2.4.1", default-features = false }
-reth-db = { git = "https://github.com/paradigmxyz/reth", tag = "v2.4.1" }
-reth-tracing = { git = "https://github.com/paradigmxyz/reth", tag = "v2.4.1" }
-reth-chainspec = { git = "https://github.com/paradigmxyz/reth", tag = "v2.4.1" }
-reth-cli-commands = { git = "https://github.com/paradigmxyz/reth", tag = "v2.4.1" }
+reth = { git = "https://github.com/paradigmxyz/reth", rev = "b89c19b1b5f2ff046fd99825cb32a2865efb5e30", default-features = false }
+reth-db = { git = "https://github.com/paradigmxyz/reth", rev = "b89c19b1b5f2ff046fd99825cb32a2865efb5e30" }
+reth-tracing = { git = "https://github.com/paradigmxyz/reth", rev = "b89c19b1b5f2ff046fd99825cb32a2865efb5e30" }
+reth-chainspec = { git = "https://github.com/paradigmxyz/reth", rev = "b89c19b1b5f2ff046fd99825cb32a2865efb5e30" }
+reth-cli-commands = { git = "https://github.com/paradigmxyz/reth", rev = "b89c19b1b5f2ff046fd99825cb32a2865efb5e30" }
 
 # Independent crates
 reth-codecs = { version = "0.5.0", default-features = false }
