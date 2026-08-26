@@ -1,26 +1,26 @@
 [package]
 name = "gnosis-primitives"
-version = "0.2.7"
+version = "0.2.8"
 edition = "2024"
 
 [dependencies]
-reth = { git = "https://github.com/paradigmxyz/reth", tag = "v2.4.1", default-features = false }
-reth-db = { git = "https://github.com/paradigmxyz/reth", tag = "v2.4.1" }
-reth-tracing = { git = "https://github.com/paradigmxyz/reth", tag = "v2.4.1" }
-reth-chainspec = { git = "https://github.com/paradigmxyz/reth", tag = "v2.4.1" }
-reth-cli-commands = { git = "https://github.com/paradigmxyz/reth", tag = "v2.4.1" }
+reth = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.1", default-features = false }
+reth-db = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.1" }
+reth-tracing = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.1" }
+reth-chainspec = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.1" }
+reth-cli-commands = { git = "https://github.com/paradigmxyz/reth", tag = "v2.5.1" }
 
 # Independent crates
-reth-codecs = { version = "0.5.0", default-features = false }
-reth-primitives-traits = { version = "0.5.0", default-features = false }
+reth-codecs = { version = "0.6.0", default-features = false }
+reth-primitives-traits = { version = "0.6.0", default-features = false }
 
 alloy-primitives = { version = "1.6.1", default-features = false }
 
-alloy-consensus = { version = "2.1.1", default-features = false }
-alloy-eips = { version = "2.1.1", default-features = false }
-alloy-serde = { version = "2.1.1", default-features = false }
+alloy-consensus = { version = "2.3.0", default-features = false }
+alloy-eips = { version = "2.3.0", default-features = false }
+alloy-serde = { version = "2.3.0", default-features = false }
 
-alloy-rpc-types = { version = "2.1.1", features = ["eth"], default-features = false }
+alloy-rpc-types = { version = "2.3.0", features = ["eth"], default-features = false }
 alloy-rlp = { version = "0.3.16", default-features = false }
 
 serde = { version = "1.0", features = ["derive"], default-features = false }
