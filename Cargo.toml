@@ -4,11 +4,11 @@ version = "0.2.9"
 edition = "2024"
 
 [dependencies]
-reth = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0", default-features = false }
-reth-db = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
-reth-tracing = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
-reth-chainspec = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
-reth-cli-commands = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth = { git = "https://github.com/paradigmxyz/reth", branch = "reth-gnosis-2.7.0", default-features = false }
+reth-db = { git = "https://github.com/paradigmxyz/reth", branch = "reth-gnosis-2.7.0" }
+reth-tracing = { git = "https://github.com/paradigmxyz/reth", branch = "reth-gnosis-2.7.0" }
+reth-chainspec = { git = "https://github.com/paradigmxyz/reth", branch = "reth-gnosis-2.7.0" }
+reth-cli-commands = { git = "https://github.com/paradigmxyz/reth", branch = "reth-gnosis-2.7.0" }
 
 # Independent crates
 reth-codecs = { version = "0.8.1", default-features = false }
