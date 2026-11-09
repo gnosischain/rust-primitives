@@ -1,14 +1,14 @@
 [package]
 name = "gnosis-primitives"
-version = "0.2.10"
+version = "0.2.11"
 edition = "2024"
 
 [dependencies]
-reth = { git = "https://github.com/paradigmxyz/reth", tag = "v2.10.0", default-features = false }
-reth-db = { git = "https://github.com/paradigmxyz/reth", tag = "v2.10.0" }
-reth-tracing = { git = "https://github.com/paradigmxyz/reth", tag = "v2.10.0" }
-reth-chainspec = { git = "https://github.com/paradigmxyz/reth", tag = "v2.10.0" }
-reth-cli-commands = { git = "https://github.com/paradigmxyz/reth", tag = "v2.10.0" }
+reth = { git = "https://github.com/paradigmxyz/reth", tag = "v2.10.1", default-features = false }
+reth-db = { git = "https://github.com/paradigmxyz/reth", tag = "v2.10.1" }
+reth-tracing = { git = "https://github.com/paradigmxyz/reth", tag = "v2.10.1" }
+reth-chainspec = { git = "https://github.com/paradigmxyz/reth", tag = "v2.10.1" }
+reth-cli-commands = { git = "https://github.com/paradigmxyz/reth", tag = "v2.10.1" }
 
 # Independent crates
 reth-codecs = { version = "0.8.2", default-features = false }
@@ -47,13 +47,13 @@ harness = false
 required-features = ["bench"]
 
 # Mirror reth's own patches (patches don't propagate from git deps).
-# Unifies evm2 revs between reth and reth-core; uses the pre-transfer URL since Cargo
-# rejects a patch from the same source.
+# Unifies evm2 revs between reth and reth-core; Cargo requires a distinct patch source
+# URL, so www.github.com is used (redirects to the public repo).
 [patch."https://github.com/alloy-rs/evm2"]
-evm2 = { git = "https://github.com/DaniPopes/evm2", rev = "592bf18c4e22fff54ac9b4db606c4ee276e345cb" }
-evm2-inspectors = { git = "https://github.com/DaniPopes/evm2", rev = "592bf18c4e22fff54ac9b4db606c4ee276e345cb" }
+evm2 = { git = "https://www.github.com/alloy-rs/evm2", rev = "01df8f6a396d0250da286cb763faa6ec292d65b5" }
+evm2-inspectors = { git = "https://www.github.com/alloy-rs/evm2", rev = "01df8f6a396d0250da286cb763faa6ec292d65b5" }
 
-# reth at v2.10.0 depends on unreleased reth-core.
+# reth at v2.10.1 depends on unreleased reth-core.
 [patch.crates-io]
 reth-codecs = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }
 reth-codecs-derive = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }
